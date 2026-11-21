@@ -177,3 +177,42 @@ extension S2Cap {
         return S2LatLngRect(south: south, west: west, north: north, east: east)
     }
 }
+
+/// A ring: everything at least `innerRadius` and at most `outerRadius` from a centre (angles in radians). A
+/// distance band, for reading nearest-first in pieces.
+public struct S2Annulus: S2Region, Hashable {
+    public var center: S2Point
+    public var innerRadius: Double
+    public var outerRadius: Double
+
+    public init(center: S2Point, innerRadius: Double, outerRadius: Double) {
+        self.center = center.normalized
+        self.innerRadius = max(0, innerRadius)
+        self.outerRadius = outerRadius
+    }
+
+    public init(center: LatLng, innerRadiusMeters: Double, outerRadiusMeters: Double) {
+        self.init(
+            center: center.point, innerRadius: Earth.radians(fromMeters: innerRadiusMeters),
+            outerRadius: Earth.radians(fromMeters: outerRadiusMeters)
+        )
+    }
+
+    public func contains(_ point: S2Point) -> Bool {
+        let angle = center.angle(to: point)
+        return angle >= innerRadius && angle <= outerRadius
+    }
+
+    public func contains(_ cell: S2Cell) -> Bool {
+        // Inside the outer cap, and nowhere nearer than the inner radius.
+        S2Cap(center: center, radius: outerRadius).contains(cell) && cell.distance(to: center) >= innerRadius
+    }
+
+    public func mayIntersect(_ cell: S2Cell) -> Bool {
+        guard S2Cap(center: center, radius: outerRadius).mayIntersect(cell) else { return false }
+        if innerRadius == 0 { return true }
+        // The cell reaches beyond the inner cap unless all of it is inside: for a cell no bigger than a
+        // hemisphere the furthest point from the centre is a vertex.
+        return cell.vertices.contains { center.angle(to: $0) >= innerRadius * (1 - 1e-12) }
+    }
+}

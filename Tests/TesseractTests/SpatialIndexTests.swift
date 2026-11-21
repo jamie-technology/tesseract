@@ -31,9 +31,17 @@ extension TesseractTest_Zone {
     var center: LatLng { LatLng(latitude: latitude, longitude: longitude) }
 }
 
+let placeByOwner = PointIndex<TesseractTest_Place>(
+    name: "place.owner-location", key: 102, prefix: [.field(\.owner)], cell: \.cell
+) { LatLng(latitude: $0.latitude, longitude: $0.longitude) }
+
+let zoneByOwner = RegionIndex<TesseractTest_Zone>(
+    name: "zone.owner-area", key: 202, prefix: [.field(\.owner)], coverage: \.coverage, levels: 8...18
+) { zone, point in zone.center.distance(to: point) <= zone.radiusMeters }
+
 let metaData = RecordMetaData(version: 1) {
-    RecordType(TesseractTest_Place.self, key: 1, primaryKey: \.id).index(placeLocation)
-    RecordType(TesseractTest_Zone.self, key: 2, primaryKey: \.id).index(zoneArea)
+    RecordType(TesseractTest_Place.self, key: 1, primaryKey: \.id).index(placeLocation).index(placeByOwner)
+    RecordType(TesseractTest_Zone.self, key: 2, primaryKey: \.id).index(zoneArea).index(zoneByOwner)
 }
 
 /// A store at a fresh path, cleared afterwards.
@@ -78,6 +86,7 @@ func places(_ count: Int, seed: UInt64) -> [TesseractTest_Place] {
             $0.latitude = at.latitude
             $0.longitude = at.longitude
             $0.cell = placeLocation.cellKey(for: at)
+            $0.owner = ["ada", "grace", "alan"][n % 3]
         }
     }
 }
@@ -93,6 +102,7 @@ func zones(_ count: Int, seed: UInt64) -> [TesseractTest_Zone] {
             $0.longitude = at.longitude
             $0.radiusMeters = radius
             $0.coverage = zoneArea.coverage(of: S2Cap(center: at, radiusMeters: radius))
+            $0.owner = ["ada", "grace", "alan"][n % 3]
         }
     }
 }
@@ -346,6 +356,110 @@ struct SpatialIndexTests {
                 }.records.map(\.record.id)
             }
             #expect(atSnapshot == ["early"])
+        }
+    }
+
+    @Test("Prefix indexes read only the prefix's entries, and match brute force")
+    func prefixQueries() async throws {
+        let somePlaces = places(450, seed: 51), someZones = zones(150, seed: 52)
+        try await withStore { database, path in
+            try await database.withRecordContext { context in
+                let store = try await open(context, path)
+                for place in somePlaces { _ = try await store.save(place) }
+                for zone in someZones { _ = try await store.save(zone) }
+            }
+            let cap = S2Cap(center: london, radiusMeters: 6_000)
+            let (graces, scanned) = try await database.withRecordContext { context in
+                let store = try await open(context, path)
+                // Scan with no record limit and a big entry budget, counting entries via an always-true filter.
+                let page = try await store.records(in: cap, using: placeByOwner, prefix: ["grace"], limits: .unlimited)
+                return (page.records.map(\.record.id), page.records.count)
+            }
+            let expected = somePlaces.filter { $0.owner == "grace" && cap.contains(placeLocation.location($0).point) }
+            #expect(Set(graces) == Set(expected.map(\.id)) && scanned == expected.count)
+
+            let point = LatLng(latitude: 51.51, longitude: -0.13)
+            let adas = try await database.withRecordContext { context in
+                try await open(context, path).records(containing: point, using: zoneByOwner, prefix: ["ada"]).records.map(\.record.id)
+            }
+            let expectedZones = someZones.filter { $0.owner == "ada" && $0.center.distance(to: point) <= $0.radiusMeters }
+            #expect(Set(adas) == Set(expectedZones.map(\.id)))
+
+            await #expect(throws: TesseractError.prefixMismatch(expected: 1, got: 0)) {
+                try await database.withRecordContext { context in
+                    _ = try await open(context, path).records(in: cap, using: placeByOwner)
+                }
+            }
+        }
+    }
+
+    @Test("Nearest-first pages across transactions match a brute-force sort, ties and dense rings included",
+          arguments: [(17, 50), (5, 2_000), (64, 30)])
+    func nearestPages(pageSize: Int, maxEntries: Int) async throws {
+        let spot = LatLng(latitude: 51.52, longitude: -0.11)
+        let stacked = (0..<40).map { n in
+            TesseractTest_Place.with {
+                $0.id = String(format: "stack-%02d", n)
+                $0.latitude = spot.latitude
+                $0.longitude = spot.longitude
+                $0.cell = placeLocation.cellKey(for: spot)
+                $0.owner = "ada"
+            }
+        }
+        let all = places(500, seed: 61) + stacked
+        let centre = LatLng(latitude: 51.515, longitude: -0.12)
+        let maxDistance = 9_000.0
+        try await withStore { database, path in
+            try await database.withRecordContext { context in
+                let store = try await open(context, path)
+                for place in all { _ = try await store.save(place) }
+            }
+            var ids: [String] = []
+            var distances: [Double] = []
+            var continuation: SpatialContinuation?
+            var pages = 0
+            repeat {
+                let page = try await database.withRecordContext { context in
+                    try await open(context, path).nearest(
+                        to: centre, using: placeLocation, within: maxDistance, pageSize: pageSize,
+                        continuation: continuation, maxEntries: maxEntries
+                    )
+                }
+                #expect(page.matches.count <= pageSize)
+                ids += page.matches.map(\.record.id)
+                distances += page.matches.map(\.distanceMeters!)
+                continuation = page.continuation
+                pages += 1
+            } while continuation != nil && pages < 1_000
+
+            let expected = all
+                .map { ($0, placeLocation.location($0).distance(to: centre)) }
+                .filter { $0.1 <= maxDistance }
+                .sorted { $0.1 != $1.1 ? $0.1 < $1.1 : Tuple($0.0.id).encode().lexicographicallyPrecedes(Tuple($1.0.id).encode()) }
+            #expect(ids == expected.map(\.0.id))
+            #expect(distances == distances.sorted())
+        }
+    }
+
+    @Test("A nearest-first continuation is refused by a different query")
+    func nearestContinuationBelongsToItsQuery() async throws {
+        try await withStore { database, path in
+            try await database.withRecordContext { context in
+                let store = try await open(context, path)
+                for place in places(60, seed: 71) { _ = try await store.save(place) }
+            }
+            let page = try await database.withRecordContext { context in
+                try await open(context, path).nearest(to: london, using: placeLocation, within: 20_000, pageSize: 5)
+            }
+            let continuation = try #require(page.continuation)
+            await #expect(throws: TesseractError.invalidContinuation) {
+                try await database.withRecordContext { context in
+                    _ = try await open(context, path).nearest(
+                        to: LatLng(latitude: 51, longitude: 0), using: placeLocation, within: 20_000, pageSize: 5,
+                        continuation: continuation
+                    )
+                }
+            }
         }
     }
 }

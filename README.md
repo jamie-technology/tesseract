@@ -64,6 +64,23 @@ let zoneArea = RegionIndex<Zone>(name: "zone.area", key: 301, coverage: \.covera
 zone.coverage = zoneArea.coverage(of: S2Cap(center: centre, radiusMeters: 250))
 ```
 
+### Composite indexes
+
+Both kinds take an equality **prefix**: key expressions placed before the cell, so the index is
+`(prefix…, cell)`. A query fixes the prefix, and its cell ranges are read inside it, so the scan
+narrows rather than filters. "Alice's places near here" reads only Alice's entries:
+
+```swift
+let placeByOwner = PointIndex<Place>(name: "place.owner-location", key: 202, prefix: [.field(\.owner)],
+                                     cell: \.cell) { LatLng(latitude: $0.latitude, longitude: $0.longitude) }
+
+try await store.records(in: S2Cap(center: here, radiusMeters: 2_000), using: placeByOwner, prefix: ["alice"])
+```
+
+Prefix columns can't fan out, and every query must give a value for each (otherwise
+`TesseractError.prefixMismatch`). Ranges on another column (`price < 10 AND within(cap)`) still
+belong in a `where:` filter: index keys are ordered by one range column at most.
+
 ## Queries
 
 On an open `FDBRecordStore`:
@@ -72,7 +89,8 @@ On an open `FDBRecordStore`:
 |---|---|
 | `records(in:using:limits:continuation:where:)` | points in any `S2Region`, a page at a time |
 | `records(within:of:using:)` | points within a distance, nearest first |
-| `nearest(_:to:within:using:)` | k nearest, searching in growing circles |
+| `nearest(_:to:within:using:)` | k nearest, in one transaction |
+| `nearest(to:using:within:pageSize:continuation:)` | nearest first, a page per transaction |
 | `records(containing:using:…)` | areas containing a point (geofence membership) |
 | `records(intersecting:using:…)` | areas whose covering meets a region's (a superset) |
 | `join(_:with:in:)` | points paired with the areas containing them |
@@ -84,7 +102,11 @@ On an open `FDBRecordStore`:
 - Pages follow index order, `(cell, primary key)`, which is total. The continuation is the last entry read (keyset pagination), so records sharing a cell are never skipped or repeated.
 - A continuation carries a fingerprint of its query and is refused by any other.
 - Each page is consistent; a sequence of pages is not a single snapshot.
-- Ordering by distance needs the whole set, so it is offered only for bounded reads: `records(within:)` and `nearest`.
+- **Nearest first** is paged in rings. Each ring is read whole and sorted by `(distance, primary key)`, then handed out a page at a time. The continuation records the ring and the last match.
+  - Rings double in width as the query moves out.
+  - A ring with more candidates than the budget is halved until it fits.
+  - More records than the budget at exactly one distance can't be split, so that ring is read whole.
+- Point queries test each index entry's leaf cell against the region before loading its record. Over-covered entries cost one key read, not a record load, and only candidates count towards `SpatialScanLimits.entries`.
 
 **Filters.** `where:` sees the stored record, including its version, before the limit counts it. For example, `{ $0.version!.commitVersion <= snapshot }` queries "as of" a database version, which is how Wavefinder replays journeys. The filter is applied after the scan: index keys are ordered by cell, so only one dimension can be a range.
 
@@ -96,9 +118,7 @@ On an open `FDBRecordStore`:
 
 ## Not yet
 
-- Composite indexes with an equality prefix, such as `owner == x AND within(cap)`, which would narrow the scan rather than filter.
 - Polygons.
-- Distance-ordered pagination across transactions (paging in rings).
 - Exact intersection tests for `records(intersecting:)`.
 
 ## License

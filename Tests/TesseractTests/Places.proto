@@ -7,6 +7,7 @@ message Place {
     double latitude = 2;
     double longitude = 3;
     int64 cell = 4;
+    string owner = 5;
 }
 
 message Zone {
@@ -15,4 +16,5 @@ message Zone {
     double longitude = 3;
     double radius_meters = 4;
     repeated int64 coverage = 5;
+    string owner = 6;
 }

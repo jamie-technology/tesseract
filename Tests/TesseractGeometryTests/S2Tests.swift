@@ -122,6 +122,24 @@ struct CoveringTests {
         }
     }
 
+    @Test("Annulus coverings contain the ring and skip its middle")
+    func annulusCoverings() {
+        let coverer = S2RegionCoverer(minLevel: 6, maxLevel: 20, maxCells: 16)
+        for centre in Points(state: 77).prefix(30) {
+            let ring = S2Annulus(center: centre, innerRadiusMeters: 2_000, outerRadiusMeters: 3_000)
+            let covering = coverer.covering(ring)
+            for bearing in stride(from: 0.0, to: 360, by: 10) {
+                for meters in [2_000.5, 2_500, 2_999.5] {
+                    let point = destination(from: centre, meters: meters, bearing: bearing)
+                    #expect(covering.contains { $0.contains(S2CellID(point)) })
+                }
+            }
+            // With cells to spare, the hole isn't covered (with few cells, a big cell may straddle it: only a cost).
+            let fine = S2RegionCoverer(minLevel: 6, maxLevel: 20, maxCells: 64).covering(ring)
+            #expect(!fine.contains { $0.contains(S2CellID(centre)) }, "the centre is well inside the hole")
+        }
+    }
+
     @Test("Coverings are reasonably tight")
     func tightness() {
         let cap = S2Cap(center: LatLng(latitude: 51.5, longitude: -0.12), radiusMeters: 500)

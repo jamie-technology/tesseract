@@ -1,0 +1,18 @@
+syntax = "proto3";
+
+package tesseract_test;
+
+message Place {
+    string id = 1;
+    double latitude = 2;
+    double longitude = 3;
+    int64 cell = 4;
+}
+
+message Zone {
+    string id = 1;
+    double latitude = 2;
+    double longitude = 3;
+    double radius_meters = 4;
+    repeated int64 coverage = 5;
+}

@@ -1,0 +1,5 @@
+{
+  "invocations": [
+    { "protoFiles": ["Places.proto"], "visibility": "internal" }
+  ]
+}
